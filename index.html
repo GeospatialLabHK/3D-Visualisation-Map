@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>3D Map - Hong Kong</title>
+  <link rel="icon" href="assets/favicon.png" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cesium@1.124/Build/Cesium/Widgets/widgets.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    #cesiumContainer { position: absolute; inset: 0; }
+    .cesium-viewer-bottom { display: none !important; }
+    #loading {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.85); z-index: 999; color: #fff;
+      font-family: system-ui, sans-serif; font-size: 18px; flex-direction: column; gap: 16px;
+    }
+    #loading.hidden { display: none; }
+    .spinner {
+      width: 40px; height: 40px; border: 3px solid rgba(255,255,255,0.2);
+      border-top-color: #4fc3f7; border-radius: 50%; animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #info-panel {
+      position: fixed; top: 12px; left: 12px; background: rgba(0,0,0,0.7);
+      color: #fff; padding: 12px 18px; border-radius: 8px; font-family: system-ui, sans-serif;
+      font-size: 14px; z-index: 10; backdrop-filter: blur(8px); line-height: 1.6;
+    }
+    #controls {
+      position: fixed; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 10;
+    }
+    .ctrl-btn {
+      width: 40px; height: 40px; border: none; border-radius: 8px;
+      background: rgba(0,0,0,0.7); color: #fff; font-size: 18px; cursor: pointer;
+      backdrop-filter: blur(8px); display: flex; align-items: center; justify-content: center;
+      transition: background 0.2s;
+    }
+    .ctrl-btn:hover { background: rgba(60,60,60,0.9); }
+    #minimap-wrapper {
+      position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      width: min(90vw, 600px); height: 180px; z-index: 10;
+    }
+    #minimap-top-bar {
+      display: flex; position: absolute; top: 6px; left: 10px; z-index: 1001; gap: 4px; align-items: center;
+    }
+    .mini-layer-btn {
+      padding: 2px 10px; border: none; cursor: pointer;
+      background: rgba(0,0,0,0.6); color: rgba(255,255,255,0.8);
+      font-size: 12px; font-family: system-ui, sans-serif; transition: all 0.2s;
+      border-radius: 4px;
+    }
+    .mini-layer-btn:hover { background: rgba(60,60,60,0.9); color: #fff; }
+    .mini-layer-btn.active { background: rgba(79,195,247,0.85); color: #fff; font-weight: 600; }
+    #minimap {
+      width: 100%; height: 100%; border-radius: 10px; overflow: hidden;
+      border: 2px solid rgba(255,255,255,0.3);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.6); position: relative;
+    }
+    #minimap-sat { width: 100%; height: 100%; display: block; }
+    #minimap-vec { width: 100%; height: 100%; display: none; }
+    .maplibregl-ctrl-attrib { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <div class="spinner"></div>
+    <span>Loading 3D Map...</span>
+  </div>
+  <div id="info-panel">
+    <strong>Hong Kong 3D Map</strong><br/>
+    Drag to rotate | Scroll to zoom | Right-click to pan
+  </div>
+  <div id="controls">
+    <button class="ctrl-btn" id="btn-reset" title="Reset View">&#8962;</button>
+    <button class="ctrl-btn" id="btn-top" title="Top View">&#8593;</button>
+  </div>
+  <div id="cesiumContainer"></div>
+  <div id="minimap-wrapper">
+    <div id="minimap-top-bar">
+      <button class="mini-layer-btn active" id="mm-sat">Satellite</button>
+      <button class="mini-layer-btn" id="mm-vec">Vector</button>
+    </div>
+    <div id="minimap">
+      <div id="minimap-sat"></div>
+      <div id="minimap-vec"></div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.124/Build/Cesium/Cesium.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script>
+    (function() {
+      const IMAGERY_URL = 'https://mapapi.geodata.gov.hk/gs/api/v1.0.0/xyz/imagery/wgs84/{z}/{x}/{y}.png';
+      const BASEMAP_VT = 'https://mapapi.geodata.gov.hk/gs/api/v1.0.0/vt/basemap/WGS84';
+      const LABEL_VT = 'https://mapapi.geodata.gov.hk/gs/api/v1.0.0/vt/label/hk/tc/WGS84';
+      const TILES_URL = 'https://data.map.gov.hk/api/3d-data/3dtiles/f2/tileset.json?key=3967f8f365694e0798af3e7678509421';
+      const HK_CENTER = Cesium.Cartesian3.fromDegrees(114.17, 22.32, 5000);
+
+      Cesium.Ion.defaultAccessToken = undefined;
+
+      function processStyle(style, vtBase, sourceName) {
+        var origSource = style.sources ? style.sources[Object.keys(style.sources)[0]] : {};
+        delete style.sources;
+        style.sources = {};
+        style.sources[sourceName] = {
+          type: 'vector',
+          tiles: [vtBase + '/tile/{z}/{y}/{x}.pbf'],
+          bounds: origSource.bounds || [113.2, 21.5, 114.91, 23.0],
+          minzoom: origSource.minzoom || 0,
+          maxzoom: origSource.maxzoom || 19,
+          attribution: origSource.attribution || 'Hong Kong Lands Department'
+        };
+        if (style.layers) {
+          style.layers.forEach(function(l) {
+            if (l.source && l.id !== 'background') l.source = sourceName;
+          });
+        }
+        if (style.sprite && style.sprite.indexOf('http') !== 0) {
+          style.sprite = vtBase + '/resources/sprites/sprite';
+        }
+        style.glyphs = BASEMAP_VT + '/resources/fonts/{fontstack}/{range}.pbf';
+        return style;
+      }
+
+      var vectorMiniMap = new maplibregl.Map({
+        container: 'minimap-vec',
+        style: {
+          version: 8,
+          sources: {},
+          layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#e8e3d8' } }]
+        },
+        center: [114.17, 22.32],
+        zoom: 11,
+        attributionControl: false,
+        renderWorldCopies: false,
+        interactive: false
+      });
+
+      Promise.all([
+        fetch(BASEMAP_VT + '/resources/styles/root.json').then(function(r) { return r.json(); }),
+        fetch(LABEL_VT + '/resources/styles/root.json').then(function(r) { return r.json(); })
+      ]).then(function(results) {
+        var basemapStyle = processStyle(results[0], BASEMAP_VT, 'basemap');
+        var labelStyle = processStyle(results[1], LABEL_VT, 'label');
+
+        var basemapLayers = basemapStyle.layers.filter(function(l) { return l.id !== 'background'; });
+        var labelLayers = labelStyle.layers.filter(function(l) { return l.id !== 'background'; });
+
+        var merged = {
+          version: 8,
+          sources: { basemap: basemapStyle.sources.basemap, label: labelStyle.sources.label },
+          layers: basemapLayers.concat(labelLayers),
+          glyphs: basemapStyle.glyphs
+        };
+        if (basemapStyle.sprite) merged.sprite = basemapStyle.sprite;
+        if (labelStyle.sprite) merged.sprite = labelStyle.sprite;
+        vectorMiniMap.setStyle(merged);
+      }).catch(function(e) { console.error('Failed to load vector styles:', e); });
+
+      const imageryProvider = new Cesium.UrlTemplateImageryProvider({
+        url: IMAGERY_URL,
+        minimumLevel: 0,
+        maximumLevel: 19,
+        credit: new Cesium.Credit('Hong Kong Lands Department')
+      });
+
+      const viewer = new Cesium.Viewer('cesiumContainer', {
+        baseLayer: false,
+        baseLayerPicker: false,
+        geocoder: false,
+        homeButton: false,
+        sceneModePicker: false,
+        navigationHelpButton: false,
+        animation: false,
+        timeline: false,
+        fullscreenButton: false,
+        vrButton: false,
+        selectionIndicator: false,
+        infoBox: false,
+        creditContainer: document.createElement('div'),
+        requestRenderMode: false,
+        maximumRenderTimeChange: Infinity
+      });
+
+      viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#0a0c10');
+      viewer.scene.globe.showGroundAtmosphere = false;
+      viewer.imageryLayers.removeAll();
+      viewer.imageryLayers.addImageryProvider(imageryProvider);
+
+      viewer.scene.globe.enableLighting = true;
+      viewer.scene.globe.depthTestAgainstTerrain = true;
+      viewer.scene.fog.enabled = true;
+      viewer.scene.skyAtmosphere.show = true;
+      viewer.scene.highDynamicRange = false;
+      viewer.scene.logarithmicDepthBuffer = true;
+
+      viewer.camera.setView({
+        destination: HK_CENTER,
+        orientation: {
+          heading: Cesium.Math.toRadians(0),
+          pitch: Cesium.Math.toRadians(-35),
+          roll: 0
+        }
+      });
+
+      Cesium.Cesium3DTileset.fromUrl(TILES_URL, {
+        maximumScreenSpaceError: 16,
+        maximumMemoryUsage: 1024,
+        skipLevelOfDetail: true,
+        baseScreenSpaceError: 1024,
+        skipLevels: 1,
+        cullWithChildrenBounds: true,
+        foveatedScreenSpaceError: true,
+        foveatedConeSize: 0.1,
+        foveatedMinimumScreenSpaceErrorRelaxation: 0.0,
+        foveatedInterpolationCallback: Cesium.Math.lerp,
+        foveatedTimeDelay: 0.2
+      }).then(function(tileset) {
+        viewer.scene.primitives.add(tileset);
+        document.getElementById('loading').classList.add('hidden');
+        console.log('3D Tiles loaded. Number of tiles:', tileset.tilesLoaded);
+      }).catch(function(error) {
+        console.error('Error loading 3D Tiles:', error);
+        document.getElementById('loading').innerHTML = '<span style="color:#ef5350">Failed to load 3D Tiles. Check console for details.</span>';
+      });
+
+      document.getElementById('btn-reset').addEventListener('click', function() {
+        viewer.camera.flyTo({
+          destination: HK_CENTER,
+          orientation: { heading: Cesium.Math.toRadians(0), pitch: Cesium.Math.toRadians(-35), roll: 0 },
+          duration: 1.5
+        });
+      });
+
+      document.getElementById('btn-top').addEventListener('click', function() {
+        viewer.camera.flyTo({
+          destination: Cesium.Cartesian3.fromDegrees(114.17, 22.32, 15000),
+          orientation: { heading: Cesium.Math.toRadians(0), pitch: Cesium.Math.toRadians(-90), roll: 0 },
+          duration: 1.5
+        });
+      });
+
+      var satMiniMap = L.map('minimap-sat', {
+        center: [22.32, 114.17],
+        zoom: 11,
+        zoomControl: false,
+        attributionControl: false,
+        dragging: false,
+        scrollWheelZoom: false,
+        doubleClickZoom: false,
+        touchZoom: false
+      });
+
+      L.tileLayer(IMAGERY_URL, { maxZoom: 19, opacity: 1 }).addTo(satMiniMap);
+
+      var viewMarker = L.marker([22.32, 114.17], {
+        icon: L.divIcon({
+          className: '',
+          html: '<div style="width:12px;height:12px;background:#4fc3f7;border:2px solid #fff;border-radius:50%;box-shadow:0 0 8px rgba(79,195,247,0.8);transform:translate(-6px,-6px);"></div>',
+          iconSize: [0, 0]
+        })
+      }).addTo(satMiniMap);
+
+      var viewCircle = L.circle([22.32, 114.17], {
+        radius: 3000, color: '#4fc3f7', fillColor: '#4fc3f7', fillOpacity: 0.12, weight: 1.5
+      }).addTo(satMiniMap);
+
+      function cesiumHeightToZoom(height) {
+        return Math.max(3, Math.min(20, Math.round(Math.log2(35000000 / Math.max(1, height)))));
+      }
+
+      var miniMode = 'satellite';
+
+      document.getElementById('mm-sat').addEventListener('click', function() {
+        miniMode = 'satellite';
+        this.classList.add('active');
+        document.getElementById('mm-vec').classList.remove('active');
+        document.getElementById('minimap-sat').style.display = 'block';
+        document.getElementById('minimap-vec').style.display = 'none';
+        var carto = viewer.camera.positionCartographic;
+        var lng = Cesium.Math.toDegrees(carto.longitude);
+        var lat = Cesium.Math.toDegrees(carto.latitude);
+        var height = carto.height;
+        satMiniMap.setView([lat, lng], Math.max(10, Math.min(16, Math.round(16 - height / 2000))), { animate: false });
+      });
+
+      document.getElementById('mm-vec').addEventListener('click', function() {
+        miniMode = 'vector';
+        this.classList.add('active');
+        document.getElementById('mm-sat').classList.remove('active');
+        document.getElementById('minimap-sat').style.display = 'none';
+        document.getElementById('minimap-vec').style.display = 'block';
+        var carto = viewer.camera.positionCartographic;
+        var lng = Cesium.Math.toDegrees(carto.longitude);
+        var lat = Cesium.Math.toDegrees(carto.latitude);
+        var height = carto.height;
+        var z = cesiumHeightToZoom(height);
+        vectorMiniMap.jumpTo({ center: [lng, lat], zoom: Math.max(3, Math.min(z, 18)) });
+        vectorMiniMap.resize();
+      });
+
+      viewer.camera.changed.addEventListener(function() {
+        var carto = viewer.camera.positionCartographic;
+        var lng = Cesium.Math.toDegrees(carto.longitude);
+        var lat = Cesium.Math.toDegrees(carto.latitude);
+        var height = carto.height;
+        var radius = Math.max(500, Math.min(height * 210, 50000));
+        viewMarker.setLatLng([lat, lng]);
+        viewCircle.setLatLng([lat, lng]);
+        viewCircle.setRadius(radius);
+        if (miniMode === 'satellite') {
+          satMiniMap.setView([lat, lng], Math.max(10, Math.min(16, Math.round(16 - height / 2000))), { animate: false });
+        } else {
+          var z = cesiumHeightToZoom(height);
+          vectorMiniMap.jumpTo({ center: [lng, lat], zoom: Math.max(3, Math.min(z, 18)) });
+        }
+      });
+      viewer.camera.changed._minimumChangePercentage = 0.1;
+    })();
+  </script>
+</body>
+</html>
